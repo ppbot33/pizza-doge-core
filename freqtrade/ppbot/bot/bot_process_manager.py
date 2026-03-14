@@ -681,6 +681,29 @@ class BotProcessManager:
         except RuntimeError:
             raise
 
+    def get_bot_balance(self, strategy_name: str) -> dict:
+        """
+        请求指定 Bot 的 /api/v1/balance，返回账户资产（currencies、note 等，与官方 Balances 一致）。
+        Bot 未注册或未运行则返回空 currencies。
+        """
+        info = self._processes.get(strategy_name)
+        if not info:
+            raise ValueError(f"策略 [{strategy_name}] 没有注册记录，请先启动")
+        if info.status == BOT_STATUS_STOPPED or not info.api_port:
+            return {"currencies": [], "total": 0, "total_bot": 0, "symbol": "", "value": 0, "value_bot": 0, "stake": "USDT", "note": ""}
+        if info.pid and not self._is_process_alive(info.pid):
+            info.status = BOT_STATUS_STOPPED
+            info.pid = None
+            self._save_state()
+            return {"currencies": [], "total": 0, "total_bot": 0, "symbol": "", "value": 0, "value_bot": 0, "stake": "USDT", "note": ""}
+        try:
+            data = self._call_bot_api(info, "GET", "/api/v1/balance")
+            if isinstance(data, dict) and "currencies" in data:
+                return data
+            return {"currencies": [], "total": 0, "total_bot": 0, "symbol": data.get("symbol", ""), "value": 0, "value_bot": 0, "stake": data.get("stake", "USDT"), "note": data.get("note", "")}
+        except RuntimeError:
+            raise
+
     def get_bot_logs(self, strategy_name: str, limit: Optional[int] = None) -> dict:
         """
         请求指定 Bot 的 /api/v1/logs，返回最近日志。
@@ -704,6 +727,76 @@ class BotProcessManager:
             if isinstance(data, dict) and "logs" in data:
                 return data
             return {"log_count": 0, "logs": []}
+        except RuntimeError:
+            raise
+
+    def _empty_daily_weekly_monthly(self) -> dict:
+        """与官方 DailyWeeklyMonthly 结构一致的空响应"""
+        return {"data": [], "stake_currency": "USDT", "fiat_display_currency": ""}
+
+    def get_bot_daily(self, strategy_name: str, timescale: int = 20) -> dict:
+        """
+        请求指定 Bot 的 /api/v1/daily?timescale=...，返回日维度收益（与官方 DailyWeeklyMonthly 一致）。
+        Bot 未注册或未运行时返回空 data。
+        """
+        info = self._processes.get(strategy_name)
+        if not info or info.status == BOT_STATUS_STOPPED or not info.api_port:
+            return self._empty_daily_weekly_monthly()
+        if info.pid and not self._is_process_alive(info.pid):
+            info.status = BOT_STATUS_STOPPED
+            info.pid = None
+            self._save_state()
+            return self._empty_daily_weekly_monthly()
+        try:
+            path = f"/api/v1/daily?timescale={max(1, int(timescale))}"
+            data = self._call_bot_api(info, "GET", path)
+            if isinstance(data, dict) and "data" in data:
+                return data
+            return self._empty_daily_weekly_monthly()
+        except RuntimeError:
+            raise
+
+    def get_bot_weekly(self, strategy_name: str, timescale: int = 20) -> dict:
+        """
+        请求指定 Bot 的 /api/v1/weekly?timescale=...，返回周维度收益。
+        Bot 未注册或未运行时返回空 data。
+        """
+        info = self._processes.get(strategy_name)
+        if not info or info.status == BOT_STATUS_STOPPED or not info.api_port:
+            return self._empty_daily_weekly_monthly()
+        if info.pid and not self._is_process_alive(info.pid):
+            info.status = BOT_STATUS_STOPPED
+            info.pid = None
+            self._save_state()
+            return self._empty_daily_weekly_monthly()
+        try:
+            path = f"/api/v1/weekly?timescale={max(1, int(timescale))}"
+            data = self._call_bot_api(info, "GET", path)
+            if isinstance(data, dict) and "data" in data:
+                return data
+            return self._empty_daily_weekly_monthly()
+        except RuntimeError:
+            raise
+
+    def get_bot_monthly(self, strategy_name: str, timescale: int = 20) -> dict:
+        """
+        请求指定 Bot 的 /api/v1/monthly?timescale=...，返回月维度收益。
+        Bot 未注册或未运行时返回空 data。
+        """
+        info = self._processes.get(strategy_name)
+        if not info or info.status == BOT_STATUS_STOPPED or not info.api_port:
+            return self._empty_daily_weekly_monthly()
+        if info.pid and not self._is_process_alive(info.pid):
+            info.status = BOT_STATUS_STOPPED
+            info.pid = None
+            self._save_state()
+            return self._empty_daily_weekly_monthly()
+        try:
+            path = f"/api/v1/monthly?timescale={max(1, int(timescale))}"
+            data = self._call_bot_api(info, "GET", path)
+            if isinstance(data, dict) and "data" in data:
+                return data
+            return self._empty_daily_weekly_monthly()
         except RuntimeError:
             raise
 

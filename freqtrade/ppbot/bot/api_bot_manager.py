@@ -10,6 +10,7 @@ Bot Manager API Router
 import json
 import logging
 import secrets
+import threading
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -120,6 +121,25 @@ class StopBotRequest(BaseModel):
     )
 
 
+def _read_bot_config_dry_run_and_trading_mode(config_path: str | None) -> tuple[Optional[bool], Optional[str]]:
+    """从配置文件读取 dry_run 和 trading_mode，失败返回 (None, None)。"""
+    import json
+    if not config_path:
+        return None, None
+    try:
+        with open(str(config_path), "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        dry_run = cfg.get("dry_run")
+        if dry_run is not None:
+            dry_run = bool(dry_run)
+        trading_mode = cfg.get("trading_mode")
+        if isinstance(trading_mode, str) and trading_mode:
+            return dry_run, trading_mode
+        return dry_run, None
+    except Exception:
+        return None, None
+
+
 class BotStatusResponse(BaseModel):
     """Bot 状态响应"""
 
@@ -137,12 +157,18 @@ class BotStatusResponse(BaseModel):
     bot_name: Optional[str] = Field(None, description="Bot 名称（展示用）")
     account_id: Optional[int] = Field(None, description="关联的交易账户 ID")
     account_name: Optional[str] = Field(None, description="关联的交易账户名称")
+    dry_run: Optional[bool] = Field(None, description="是否模拟盘（从 config 读取）")
+    trading_mode: Optional[str] = Field(None, description="现货 spot / 期货 futures（从 config 读取）")
+    position_pairs: Optional[list[str]] = Field(None, description="当前持仓交易对（运行中时从 status 拉取）")
 
     @classmethod
     def from_process_info(
         cls,
         info: BotProcessInfo,
         account_name: Optional[str] = None,
+        dry_run: Optional[bool] = None,
+        trading_mode: Optional[str] = None,
+        position_pairs: Optional[list[str]] = None,
     ) -> "BotStatusResponse":
         return cls(
             strategy_name=info.strategy_name,
@@ -157,6 +183,9 @@ class BotStatusResponse(BaseModel):
             bot_name=getattr(info, "bot_name", None),
             account_id=getattr(info, "account_id", None),
             account_name=account_name,
+            dry_run=dry_run,
+            trading_mode=trading_mode,
+            position_pairs=position_pairs,
         )
 
 
@@ -216,13 +245,25 @@ def list_bots(ft_config: dict = Depends(get_config)) -> BotListResponse:
     all_bots = manager.list_all_bots()
     accounts = load_accounts(ft_config)
     id_to_name = {a.get("id"): a.get("name") for a in accounts if a.get("id") is not None}
-    bots = [
-        BotStatusResponse.from_process_info(
-            bot,
-            account_name=id_to_name.get(getattr(bot, "account_id", None)) if getattr(bot, "account_id", None) else None,
+    bots = []
+    for bot in all_bots:
+        dry_run, trading_mode = _read_bot_config_dry_run_and_trading_mode(bot.config_path)
+        position_pairs = None
+        if bot.status in (BOT_STATUS_RUNNING, BOT_STATUS_PAUSED):
+            try:
+                trades = manager.get_bot_open_trades(bot.strategy_name)
+                position_pairs = [t.get("pair") for t in trades if isinstance(t, dict) and t.get("pair")]
+            except Exception:
+                pass
+        bots.append(
+            BotStatusResponse.from_process_info(
+                bot,
+                account_name=id_to_name.get(getattr(bot, "account_id", None)) if getattr(bot, "account_id", None) else None,
+                dry_run=dry_run,
+                trading_mode=trading_mode,
+                position_pairs=position_pairs or None,
+            )
         )
-        for bot in all_bots
-    ]
     return BotListResponse(total=len(bots), bots=bots)
 
 
@@ -367,20 +408,101 @@ def get_bot_whitelist_proxy(strategy_name: str):
 
 
 @router.get(
+    "/bots/{strategy_name}/balance",
+    summary="Bot 账户资产（代理）",
+    description="请求指定 Bot 的 /api/v1/balance，返回 currencies、note 等（与官方 Balances 一致）。Bot 未运行时返回空 currencies。",
+)
+def get_bot_balance_proxy(strategy_name: str):
+    manager = get_manager()
+    try:
+        return manager.get_bot_balance(strategy_name)
+    except ValueError:
+        return {"currencies": [], "total": 0, "total_bot": 0, "symbol": "", "value": 0, "value_bot": 0, "stake": "USDT", "note": ""}
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+@router.get(
+    "/bots/{strategy_name}/daily",
+    summary="Bot 日维度收益（代理）",
+    description="请求指定 Bot 的 /api/v1/daily?timescale=...，与官方 DailyWeeklyMonthly 一致。Bot 未运行时返回空 data。",
+)
+def get_bot_daily_proxy(
+    strategy_name: str,
+    timescale: int = Query(20, ge=1, description="天数"),
+):
+    manager = get_manager()
+    try:
+        return manager.get_bot_daily(strategy_name, timescale=timescale)
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+@router.get(
+    "/bots/{strategy_name}/weekly",
+    summary="Bot 周维度收益（代理）",
+    description="请求指定 Bot 的 /api/v1/weekly?timescale=...。Bot 未运行时返回空 data。",
+)
+def get_bot_weekly_proxy(
+    strategy_name: str,
+    timescale: int = Query(20, ge=1, description="周数"),
+):
+    manager = get_manager()
+    try:
+        return manager.get_bot_weekly(strategy_name, timescale=timescale)
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+@router.get(
+    "/bots/{strategy_name}/monthly",
+    summary="Bot 月维度收益（代理）",
+    description="请求指定 Bot 的 /api/v1/monthly?timescale=...。Bot 未运行时返回空 data。",
+)
+def get_bot_monthly_proxy(
+    strategy_name: str,
+    timescale: int = Query(20, ge=1, description="月数"),
+):
+    manager = get_manager()
+    try:
+        return manager.get_bot_monthly(strategy_name, timescale=timescale)
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+@router.get(
     "/bots/{strategy_name}/logs",
     summary="Bot 日志（代理）",
-    description="请求指定 Bot 的 /api/v1/logs，返回最近日志。Bot 未运行时返回空列表。",
+    description="请求指定 Bot 的 /api/v1/logs，返回最近日志。Bot 未注册或未运行时返回空列表。",
 )
 def get_bot_logs_proxy(
     strategy_name: str,
     limit: Optional[int] = Query(None, description="返回条数限制"),
 ):
-    """代理到 Bot 的 /api/v1/logs。"""
+    """代理到 Bot 的 /api/v1/logs；策略未注册或未运行时返回空列表，不返回 404。"""
     manager = get_manager()
     try:
         return manager.get_bot_logs(strategy_name, limit=limit)
-    except ValueError as error:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except ValueError:
+        return {"log_count": 0, "logs": []}
     except RuntimeError as error:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -410,7 +532,21 @@ def get_bot_status(
         accounts = load_accounts(ft_config)
         acc = next((a for a in accounts if a.get("id") == info.account_id), None)
         account_name = acc.get("name") if acc else None
-    return BotStatusResponse.from_process_info(info, account_name=account_name)
+    dry_run, trading_mode = _read_bot_config_dry_run_and_trading_mode(info.config_path)
+    position_pairs = None
+    if info.status in (BOT_STATUS_RUNNING, BOT_STATUS_PAUSED):
+        try:
+            trades = manager.get_bot_open_trades(strategy_name)
+            position_pairs = [t.get("pair") for t in trades if isinstance(t, dict) and t.get("pair")]
+        except Exception:
+            pass
+    return BotStatusResponse.from_process_info(
+        info,
+        account_name=account_name,
+        dry_run=dry_run,
+        trading_mode=trading_mode,
+        position_pairs=position_pairs,
+    )
 
 
 @router.post(
@@ -716,15 +852,26 @@ def resume_bot(
         ) from error
 
 
+def _run_stop_bot(strategy_name: str, force: bool) -> None:
+    """在后台线程中执行 stop_bot，避免接口长时间阻塞。"""
+    manager = get_manager()
+    try:
+        manager.stop_bot(strategy_name, force=force)
+        logger.info(f"Bot [{strategy_name}] 后台停止完成")
+    except Exception as e:
+        logger.exception("后台停止 Bot [%s] 失败: %s", strategy_name, e)
+
+
 @router.post(
     "/bots/{strategy_name}/stop",
     response_model=OperationResponse,
     summary="停止 Bot",
     description=(
         "停止指定策略的 Bot 进程。\n\n"
-        "默认优雅退出（先调用 Bot API 停止，再发送 SIGTERM，等待 15 秒后若未退出则 SIGKILL）。\n\n"
+        "接口立即返回 202，实际停止在后台执行（先调用 Bot API 停止，再 SIGTERM，最多等 15 秒后若未退出则 SIGKILL）。\n\n"
         "设置 `force=true` 可跳过优雅退出直接强制终止。"
     ),
+    status_code=status.HTTP_202_ACCEPTED,
 )
 def stop_bot(
     strategy_name: str,
@@ -732,22 +879,24 @@ def stop_bot(
 ) -> OperationResponse:
     manager = get_manager()
     try:
-        info = manager.stop_bot(strategy_name, force=request.force)
-        return OperationResponse(
-            success=True,
-            message=f"Bot [{strategy_name}] 已停止",
-            bot=BotStatusResponse.from_process_info(info),
-        )
+        info = manager._get_running_bot(strategy_name)
     except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(error),
         ) from error
-    except RuntimeError as error:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(error),
-        ) from error
+    thread = threading.Thread(
+        target=_run_stop_bot,
+        args=(strategy_name, request.force),
+        name=f"stop_bot_{strategy_name}",
+        daemon=True,
+    )
+    thread.start()
+    return OperationResponse(
+        success=True,
+        message="停止已提交，正在后台执行",
+        bot=BotStatusResponse.from_process_info(info),
+    )
 
 
 @router.delete(
