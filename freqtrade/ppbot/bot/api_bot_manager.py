@@ -21,7 +21,7 @@ from freqtrade.ppbot.bot.bot_process_manager import (
     BotProcessInfo,
     get_manager,
 )
-from freqtrade.rpc.api_server.api_accounts import load_accounts
+from freqtrade.ppbot.storage.accounts_storage import load_accounts
 from freqtrade.rpc.api_server.deps import get_config
 
 

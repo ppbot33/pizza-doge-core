@@ -49,6 +49,12 @@ def get_all(user_data_dir: str | Path) -> list[dict[str, Any]]:
     return [_enrich(a) for a in raw]
 
 
+def load_accounts(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """根据 freqtrade config 返回账号列表，供 bot_manager 等模块使用。"""
+    ud = config.get("user_data_dir", "user_data")
+    return get_all(ud)
+
+
 def get_by_id(user_data_dir: str | Path, account_id: int) -> dict[str, Any] | None:
     """按 id 查询单条，不存在返回 None。"""
     with _LOCK:
