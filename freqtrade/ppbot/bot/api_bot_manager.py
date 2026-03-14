@@ -912,7 +912,7 @@ def _build_config_from_request(
             "enable_openapi": False,
             # RFC 7518 建议 HS256 的 key 至少 32 字节，否则会触发 InsecureKeyLengthWarning
             "jwt_secret_key": f"pizza_bot_{strategy_name}_{request.api_port}_{secrets.token_hex(16)}",
-            "CORS_origins": ["http://localhost:{request.api_port}"],
+            "CORS_origins": ["http://localhost:{request.api_port}","http://localhost:8080"],
             "username": "pbot",
             "password": "12300",
         },
