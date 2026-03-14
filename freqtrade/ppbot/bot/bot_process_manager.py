@@ -68,6 +68,8 @@ class BotProcessInfo:
     # 展示用：模拟盘/实盘、现货/期货（内存配置启动时从 config 写入，避免无配置文件时读不到）
     dry_run: Optional[bool] = None
     trading_mode: Optional[str] = None
+    # 该次运行使用的 db_url（仅内存配置启动时写入），用于已停止 Bot 的历史统计
+    db_url: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -91,6 +93,8 @@ class BotProcessInfo:
             kwargs["dry_run"] = None
         if "trading_mode" not in kwargs:
             kwargs["trading_mode"] = None
+        if "db_url" not in kwargs:
+            kwargs["db_url"] = None
         return cls(**kwargs)
 
 
@@ -387,6 +391,7 @@ class BotProcessManager:
             account_id=account_id,
             dry_run=config.get("dry_run") if isinstance(config.get("dry_run"), bool) else None,
             trading_mode=str(config["trading_mode"]) if config.get("trading_mode") else None,
+            db_url=config.get("db_url"),
         )
         self._processes[strategy_name] = info
         self._save_state()
@@ -961,6 +966,114 @@ class BotProcessManager:
         for k in last_ts_keys:
             merged.setdefault(k, "" if "date" in k or "humanized" in k else 0)
         return _fill_profit_defaults(merged)
+
+    def aggregate_daily(self, timescale: int = 7) -> dict:
+        """
+        向所有运行中的 Bot 请求 /api/v1/daily?timescale=...，按日期合并为一份 DailyWeeklyMonthly。
+        无运行中 Bot 时返回空 data。
+        """
+        running = [
+            info
+            for info in self._processes.values()
+            if info.status in (BOT_STATUS_RUNNING, BOT_STATUS_PAUSED)
+            and info.api_port
+            and (not info.pid or self._is_process_alive(info.pid))
+        ]
+        if not running:
+            return {"data": [], "stake_currency": "USDT", "fiat_display_currency": ""}
+
+        date_map: dict[str, dict] = {}
+        stake_currency = "USDT"
+        for info in running:
+            try:
+                data = self._call_bot_api(
+                    info, "GET", f"/api/v1/daily?timescale={max(1, int(timescale))}"
+                )
+            except Exception as e:
+                logger.warning("聚合 [%s] daily 失败: %s", info.strategy_name, e)
+                continue
+            if not isinstance(data, dict) or "data" not in data:
+                continue
+            stake_currency = data.get("stake_currency") or stake_currency
+            for row in data.get("data") or []:
+                if not isinstance(row, dict):
+                    continue
+                dt = row.get("date")
+                if dt is None:
+                    continue
+                key = dt if isinstance(dt, str) else str(dt)
+                cur = date_map.setdefault(
+                    key,
+                    {
+                        "date": key,
+                        "abs_profit": 0.0,
+                        "rel_profit": 0.0,
+                        "starting_balance": 0.0,
+                        "fiat_value": 0.0,
+                        "trade_count": 0,
+                    },
+                )
+                cur["abs_profit"] += float(row.get("abs_profit") or 0)
+                cur["rel_profit"] += float(row.get("rel_profit") or 0)
+                cur["starting_balance"] += float(row.get("starting_balance") or 0)
+                cur["fiat_value"] += float(row.get("fiat_value") or 0)
+                cur["trade_count"] += int(row.get("trade_count") or 0)
+
+        sorted_data = sorted(date_map.values(), key=lambda x: x["date"])
+        return {
+            "data": sorted_data,
+            "stake_currency": stake_currency,
+            "fiat_display_currency": "",
+        }
+
+    def aggregate_performance(self) -> list[dict]:
+        """
+        向所有运行中的 Bot 请求 /api/v1/performance，按 pair 合并（profit_abs/count 相加）。
+        无运行中 Bot 时返回空列表。
+        """
+        running = [
+            info
+            for info in self._processes.values()
+            if info.status in (BOT_STATUS_RUNNING, BOT_STATUS_PAUSED)
+            and info.api_port
+            and (not info.pid or self._is_process_alive(info.pid))
+        ]
+        if not running:
+            return []
+
+        pair_map: dict[str, dict] = {}
+        for info in running:
+            try:
+                data = self._call_bot_api(info, "GET", "/api/v1/performance")
+            except Exception as e:
+                logger.warning("聚合 [%s] performance 失败: %s", info.strategy_name, e)
+                continue
+            if not isinstance(data, list):
+                continue
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                pair = row.get("pair")
+                if not pair:
+                    continue
+                cur = pair_map.setdefault(
+                    pair,
+                    {
+                        "pair": pair,
+                        "profit_ratio": 0.0,
+                        "profit_pct": 0.0,
+                        "profit_abs": 0.0,
+                        "count": 0,
+                        "profit": 0.0,
+                    },
+                )
+                cur["profit_abs"] += float(row.get("profit_abs") or 0)
+                cur["profit"] += float(row.get("profit") or 0)
+                cur["count"] += int(row.get("count") or 0)
+                cur["profit_ratio"] = cur["profit_ratio"] + float(row.get("profit_ratio") or 0)
+                cur["profit_pct"] = cur["profit_pct"] + float(row.get("profit_pct") or 0)
+
+        return list(pair_map.values())
 
 
 def _empty_profit_response() -> dict:

@@ -251,6 +251,31 @@ def aggregate_profit() -> dict:
 
 
 @router.get(
+    "/aggregate/daily",
+    summary="汇总各 Bot 每日收益",
+    description=(
+        "向所有运行中的 Bot 请求 /api/v1/daily?timescale=... 并按日期合并，"
+        "与官方 DailyWeeklyMonthly 结构兼容。"
+    ),
+)
+def aggregate_daily(timescale: int = Query(7, ge=1, description="天数")) -> dict:
+    manager = get_manager()
+    return manager.aggregate_daily(timescale)
+
+
+@router.get(
+    "/aggregate/performance",
+    summary="汇总各 Bot 交易对表现",
+    description=(
+        "向所有运行中的 Bot 请求 /api/v1/performance 并按 pair 合并。"
+    ),
+)
+def aggregate_performance() -> list:
+    manager = get_manager()
+    return manager.aggregate_performance()
+
+
+@router.get(
     "/health",
     summary="健康检查",
     description="检查 Bot Manager API 服务是否正常运行（无需认证）。",
@@ -1069,3 +1094,193 @@ def delete_bot_record(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(error),
         ) from error
+
+
+# ─── 回测历史增强（收益率、交易数等）──────────────────────────────────────────────
+
+
+@router.get(
+    "/backtest/history",
+    summary="回测历史列表（含收益率、交易数）",
+    description=(
+        "基于官方 backtest 结果文件列表，从结果文件中读取并填充 profit_total、profit_total_abs、total_trades 等字段，供回测管理页展示。"
+    ),
+)
+def backtest_history_enriched(ft_config: dict = Depends(get_config)) -> list[dict]:
+    from pathlib import Path
+
+    from freqtrade.data.btanalysis import get_backtest_resultlist, load_backtest_stats
+    from freqtrade.misc import is_file_in_dir
+
+    bt_dir: Path = ft_config["user_data_dir"] / "backtest_results"
+    if not bt_dir.is_dir():
+        return []
+
+    raw = get_backtest_resultlist(bt_dir)
+    file_cache: dict[str, dict | None] = {}
+    result: list[dict] = []
+
+    for entry in raw:
+        fn_stem = entry["filename"]
+        strategy_name = entry["strategy"]
+
+        if fn_stem not in file_cache:
+            path = None
+            for ext in [".zip", ".json"]:
+                candidate = (bt_dir / fn_stem).with_suffix(ext)
+                if is_file_in_dir(candidate, bt_dir):
+                    path = candidate
+                    break
+            if path is None:
+                file_cache[fn_stem] = None
+            else:
+                try:
+                    file_cache[fn_stem] = load_backtest_stats(path)
+                except Exception:
+                    logger.exception("Loading backtest file %s", path)
+                    file_cache[fn_stem] = None
+
+        data = file_cache[fn_stem]
+        out = dict(entry)
+        out["profit_total"] = None
+        out["profit_total_abs"] = None
+        out["total_trades"] = None
+        if data and isinstance(data.get("strategy"), dict) and strategy_name in data["strategy"]:
+            st = data["strategy"][strategy_name]
+            if isinstance(st, dict):
+                out["profit_total"] = st.get("profit_total")
+                out["profit_total_abs"] = st.get("profit_total_abs")
+                out["total_trades"] = st.get("total_trades")
+        result.append(out)
+
+    return result
+
+
+# ─── 已停止 Bot 历史统计（从 DB 文件读交易后聚合）──────────────────────────────────
+
+_historical_db_lock = threading.Lock()
+
+
+def _stats_from_trades_df(df, stake_currency: str = "USDT"):
+    """从 load_trades_from_db 返回的 DataFrame 聚合成 profit / daily / performance 结构。"""
+    import pandas as pd
+
+    if df is None or df.empty:
+        return {
+            "profit": {
+                "profit_all_coin": 0.0,
+                "profit_all_percent": 0.0,
+                "closed_trade_count": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "stake_currency": stake_currency,
+            },
+            "daily": {"data": [], "stake_currency": stake_currency},
+            "performance": [],
+        }
+
+    closed = df.loc[~df["is_open"].astype(bool)] if "is_open" in df.columns else df
+    if closed.empty:
+        return {
+            "profit": {
+                "profit_all_coin": 0.0,
+                "profit_all_percent": 0.0,
+                "closed_trade_count": 0,
+                "winning_trades": 0,
+                "losing_trades": 0,
+                "stake_currency": stake_currency,
+            },
+            "daily": {"data": [], "stake_currency": stake_currency},
+            "performance": [],
+        }
+
+    profit_abs = closed["profit_abs"].fillna(0).astype(float)
+    profit_all_coin = float(profit_abs.sum())
+    closed_count = len(closed)
+    winning_trades = int((profit_abs > 0).sum())
+    losing_trades = int((profit_abs < 0).sum())
+    profit_all_percent = (profit_all_coin / float(closed["stake_amount"].sum())) if closed["stake_amount"].sum() else 0.0
+
+    daily_data = []
+    if "close_date" in closed.columns:
+        closed_copy = closed.copy()
+        closed_copy["_date"] = pd.to_datetime(closed_copy["close_date"]).dt.date
+        daily = closed_copy.groupby("_date").agg({"profit_abs": "sum"}).join(closed_copy.groupby("_date").size().rename("trade_count"))
+        daily_data = [
+            {"date": str(k), "abs_profit": float(v["profit_abs"]), "trade_count": int(v["trade_count"])}
+            for k, v in daily.iterrows()
+        ]
+        daily_data.sort(key=lambda x: x["date"])
+
+    perf_list = []
+    if "pair" in closed.columns:
+        for pair, grp in closed.groupby("pair"):
+            pabs = float(grp["profit_abs"].sum())
+            perf_list.append({
+                "pair": pair,
+                "profit_abs": pabs,
+                "count": len(grp),
+                "profit": pabs,
+                "profit_ratio": 0.0,
+                "profit_pct": 0.0,
+            })
+
+    return {
+        "profit": {
+            "profit_all_coin": profit_all_coin,
+            "profit_all_percent": round(profit_all_percent, 6),
+            "closed_trade_count": closed_count,
+            "winning_trades": winning_trades,
+            "losing_trades": losing_trades,
+            "stake_currency": stake_currency,
+        },
+        "daily": {"data": daily_data, "stake_currency": stake_currency},
+        "performance": perf_list,
+    }
+
+
+@router.get(
+    "/bots/{strategy_name}/history/stats",
+    summary="已停止 Bot 的历史统计（从 DB 文件读取）",
+    description=(
+        "当该策略 Bot 已停止且启动时保存了 db_url 时，从对应 SQLite 文件读取交易记录并聚合成"
+        " profit / daily / performance 结构，与官方 /profit、/daily、/performance 兼容。"
+        " 若 Bot 正在运行请直接调用 /bots/{strategy_name}/profit 等。"
+    ),
+)
+def bot_history_stats(
+    strategy_name: str,
+    ft_config: dict = Depends(get_config),
+) -> dict:
+    from freqtrade.data.btanalysis import load_trades_from_db
+    from freqtrade.persistence.models import init_db
+
+    manager = get_manager()
+    info = manager._processes.get(strategy_name)
+    if not info:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"未找到策略 [{strategy_name}] 的记录")
+    db_url = getattr(info, "db_url", None) or (info.to_dict() if hasattr(info, "to_dict") else {}).get("db_url")
+    if not db_url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该 Bot 未保存 db_url（仅通过「内存配置」启动的 Bot 会保存），无法读取历史 DB",
+        )
+
+    stake_currency = ft_config.get("stake_currency") or "USDT"
+    main_db_url = ft_config.get("db_url")
+
+    with _historical_db_lock:
+        try:
+            init_db(db_url)
+            df = load_trades_from_db(db_url, strategy=None)
+        except Exception as e:
+            logger.exception("读取历史 DB %s 失败", db_url)
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
+        finally:
+            if main_db_url:
+                try:
+                    init_db(main_db_url)
+                except Exception:
+                    pass
+
+    return _stats_from_trades_df(df, stake_currency)
