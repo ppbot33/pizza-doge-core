@@ -160,6 +160,15 @@ class BotStatusResponse(BaseModel):
     dry_run: Optional[bool] = Field(None, description="是否模拟盘（从 config 读取）")
     trading_mode: Optional[str] = Field(None, description="现货 spot / 期货 futures（从 config 读取）")
     position_pairs: Optional[list[str]] = Field(None, description="当前持仓交易对（运行中时从 status 拉取）")
+    # 运行/暂停时：总收益、今日盈亏、持仓价值、今日交易；已停止时：总收益、交易量、交易次数
+    profit_all_coin: Optional[float] = Field(None, description="总收益（绝对值，计价货币）")
+    profit_all_ratio: Optional[float] = Field(None, description="总收益率（比例，如 0.01 表示 1%）")
+    trade_count: Optional[int] = Field(None, description="交易次数")
+    trading_volume: Optional[float] = Field(None, description="交易量（计价货币）")
+    position_value: Optional[float] = Field(None, description="持仓价值（运行/暂停时）")
+    today_profit_coin: Optional[float] = Field(None, description="今日盈亏（绝对值）")
+    today_profit_ratio: Optional[float] = Field(None, description="今日盈亏率（比例）")
+    today_trade_count: Optional[int] = Field(None, description="今日交易笔数")
 
     @classmethod
     def from_process_info(
@@ -169,6 +178,14 @@ class BotStatusResponse(BaseModel):
         dry_run: Optional[bool] = None,
         trading_mode: Optional[str] = None,
         position_pairs: Optional[list[str]] = None,
+        profit_all_coin: Optional[float] = None,
+        profit_all_ratio: Optional[float] = None,
+        trade_count: Optional[int] = None,
+        trading_volume: Optional[float] = None,
+        position_value: Optional[float] = None,
+        today_profit_coin: Optional[float] = None,
+        today_profit_ratio: Optional[float] = None,
+        today_trade_count: Optional[int] = None,
     ) -> "BotStatusResponse":
         return cls(
             strategy_name=info.strategy_name,
@@ -186,6 +203,14 @@ class BotStatusResponse(BaseModel):
             dry_run=dry_run,
             trading_mode=trading_mode,
             position_pairs=position_pairs,
+            profit_all_coin=profit_all_coin,
+            profit_all_ratio=profit_all_ratio,
+            trade_count=trade_count,
+            trading_volume=trading_volume,
+            position_value=position_value,
+            today_profit_coin=today_profit_coin,
+            today_profit_ratio=today_profit_ratio,
+            today_trade_count=today_trade_count,
         )
 
 
@@ -245,16 +270,129 @@ def list_bots(ft_config: dict = Depends(get_config)) -> BotListResponse:
     all_bots = manager.list_all_bots()
     accounts = load_accounts(ft_config)
     id_to_name = {a.get("id"): a.get("name") for a in accounts if a.get("id") is not None}
+    from datetime import date as date_type
+
     bots = []
+    today_str = date_type.today().isoformat()
     for bot in all_bots:
-        dry_run, trading_mode = _read_bot_config_dry_run_and_trading_mode(bot.config_path)
+        dry_run = getattr(bot, "dry_run", None)
+        trading_mode = getattr(bot, "trading_mode", None)
+        if dry_run is None or trading_mode is None:
+            from_file_dr, from_file_tm = _read_bot_config_dry_run_and_trading_mode(bot.config_path)
+            if dry_run is None:
+                dry_run = from_file_dr
+            if trading_mode is None:
+                trading_mode = from_file_tm
         position_pairs = None
+        profit_all_coin = None
+        profit_all_ratio = None
+        trade_count = None
+        trading_volume = None
+        position_value = None
+        today_profit_coin = None
+        today_profit_ratio = None
+        today_trade_count = None
         if bot.status in (BOT_STATUS_RUNNING, BOT_STATUS_PAUSED):
             try:
                 trades = manager.get_bot_open_trades(bot.strategy_name)
                 position_pairs = [t.get("pair") for t in trades if isinstance(t, dict) and t.get("pair")]
+                position_value = 0.0
+                for t in trades:
+                    if not isinstance(t, dict):
+                        continue
+                    stake = t.get("stake_amount") or t.get("open_trade_value")
+                    if stake is not None:
+                        try:
+                            position_value += float(stake)
+                        except (TypeError, ValueError):
+                            pass
             except Exception:
                 pass
+            try:
+                profit = manager.get_bot_profit(bot.strategy_name)
+                if isinstance(profit, dict):
+                    profit_all_coin = profit.get("profit_all_coin")
+                    profit_all_ratio = profit.get("profit_all_ratio")
+                    trade_count = profit.get("trade_count")
+                    trading_volume = profit.get("trading_volume")
+                    if profit_all_coin is not None:
+                        try:
+                            profit_all_coin = float(profit_all_coin)
+                        except (TypeError, ValueError):
+                            profit_all_coin = None
+                    if profit_all_ratio is not None:
+                        try:
+                            profit_all_ratio = float(profit_all_ratio)
+                        except (TypeError, ValueError):
+                            profit_all_ratio = None
+                    if trade_count is not None:
+                        try:
+                            trade_count = int(trade_count)
+                        except (TypeError, ValueError):
+                            trade_count = None
+                    if trading_volume is not None:
+                        try:
+                            trading_volume = float(trading_volume)
+                        except (TypeError, ValueError):
+                            trading_volume = None
+            except Exception:
+                pass
+            try:
+                daily = manager.get_bot_daily(bot.strategy_name, timescale=3)
+                data = daily.get("data") or []
+                for row in data:
+                    if isinstance(row, dict) and row.get("date") == today_str:
+                        today_profit_coin = row.get("abs_profit")
+                        today_profit_ratio = row.get("rel_profit")
+                        today_trade_count = row.get("trade_count")
+                        if today_profit_coin is not None:
+                            try:
+                                today_profit_coin = float(today_profit_coin)
+                            except (TypeError, ValueError):
+                                today_profit_coin = None
+                        if today_profit_ratio is not None:
+                            try:
+                                today_profit_ratio = float(today_profit_ratio)
+                            except (TypeError, ValueError):
+                                today_profit_ratio = None
+                        if today_trade_count is not None:
+                            try:
+                                today_trade_count = int(today_trade_count)
+                            except (TypeError, ValueError):
+                                today_trade_count = None
+                        break
+            except Exception:
+                pass
+        elif bot.status == BOT_STATUS_STOPPED:
+            try:
+                profit = manager.get_bot_profit(bot.strategy_name)
+            except Exception:
+                profit = {}
+            if isinstance(profit, dict):
+                profit_all_coin = profit.get("profit_all_coin")
+                profit_all_ratio = profit.get("profit_all_ratio")
+                trade_count = profit.get("trade_count")
+                trading_volume = profit.get("trading_volume")
+                if profit_all_coin is not None:
+                    try:
+                        profit_all_coin = float(profit_all_coin)
+                    except (TypeError, ValueError):
+                        profit_all_coin = None
+                if profit_all_ratio is not None:
+                    try:
+                        profit_all_ratio = float(profit_all_ratio)
+                    except (TypeError, ValueError):
+                        profit_all_ratio = None
+                if trade_count is not None:
+                    try:
+                        trade_count = int(trade_count)
+                    except (TypeError, ValueError):
+                        trade_count = None
+                if trading_volume is not None:
+                    try:
+                        trading_volume = float(trading_volume)
+                    except (TypeError, ValueError):
+                        trading_volume = None
         bots.append(
             BotStatusResponse.from_process_info(
                 bot,
@@ -262,6 +400,14 @@ def list_bots(ft_config: dict = Depends(get_config)) -> BotListResponse:
                 dry_run=dry_run,
                 trading_mode=trading_mode,
                 position_pairs=position_pairs or None,
+                profit_all_coin=profit_all_coin,
+                profit_all_ratio=profit_all_ratio,
+                trade_count=trade_count,
+                trading_volume=trading_volume,
+                position_value=position_value,
+                today_profit_coin=today_profit_coin,
+                today_profit_ratio=today_profit_ratio,
+                today_trade_count=today_trade_count,
             )
         )
     return BotListResponse(total=len(bots), bots=bots)

@@ -65,6 +65,9 @@ class BotProcessInfo:
     # 展示用：对应 config.bot_name、启动时选择的账户
     bot_name: Optional[str] = None
     account_id: Optional[int] = None
+    # 展示用：模拟盘/实盘、现货/期货（内存配置启动时从 config 写入，避免无配置文件时读不到）
+    dry_run: Optional[bool] = None
+    trading_mode: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -84,6 +87,10 @@ class BotProcessInfo:
             kwargs["bot_name"] = None
         if "account_id" not in kwargs:
             kwargs["account_id"] = None
+        if "dry_run" not in kwargs:
+            kwargs["dry_run"] = None
+        if "trading_mode" not in kwargs:
+            kwargs["trading_mode"] = None
         return cls(**kwargs)
 
 
@@ -378,6 +385,8 @@ class BotProcessManager:
             api_password=api_password,
             bot_name=bot_name,
             account_id=account_id,
+            dry_run=config.get("dry_run") if isinstance(config.get("dry_run"), bool) else None,
+            trading_mode=str(config["trading_mode"]) if config.get("trading_mode") else None,
         )
         self._processes[strategy_name] = info
         self._save_state()
