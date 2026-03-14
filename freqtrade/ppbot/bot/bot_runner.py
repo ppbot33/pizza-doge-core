@@ -61,6 +61,12 @@ def main() -> None:
     if "runmode" not in config:
         config["runmode"] = RunMode.DRY_RUN if config.get("dry_run", True) else RunMode.LIVE
 
+    # 官方代码期望 user_data_dir / datadir 为 Path，且会调用 .joinpath()；JSON 里只能是字符串，此处转为绝对 Path（相对项目根）
+    if config.get("user_data_dir") is not None:
+        config["user_data_dir"] = (_PROJECT_ROOT / str(config["user_data_dir"])).resolve()
+    if config.get("datadir") is not None:
+        config["datadir"] = (_PROJECT_ROOT / str(config["datadir"])).resolve()
+
     worker = Worker(args={}, config=config)
     worker.run()
 

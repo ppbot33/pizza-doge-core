@@ -7,8 +7,10 @@ Bot Manager API Router
 认证由 Freqtrade webserver 统一处理（http_basic_or_jwt_token），无需在此重复认证。
 """
 
+import json
 import logging
-from typing import Optional
+import secrets
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -85,18 +87,26 @@ class StartBotWithConfigRequest(BaseModel):
         description="最大同时持仓数量，-1 表示不限制",
         ge=-1,
     )
-    timeframe: str = Field(
-        default="5m",
-        description="K 线时间周期，如 '1m'、'5m'、'15m'、'1h'",
-        examples=["5m"],
+    timeframe: Optional[str] = Field(
+        default=None,
+        description="K 线时间周期，如 '1m'、'5m'、'15m'、'1h'。不传则使用策略类中定义的 timeframe（官方行为）",
+        examples=["15m"],
     )
     api_username: str = Field(
-        default="freqtrader",
+        default="pizza-bot",
         description="Bot 自身 API Server 的用户名（用于暂停/恢复操作）",
     )
     api_password: str = Field(
-        default="pizza_bot",
+        default="pizza_bot_A.*",
         description="Bot 自身 API Server 的密码",
+    )
+    bot_name: str = Field(
+        default="ppbot",
+        description="交易 Bot 名称，对应 config 中的 bot_name",
+    )
+    advanced_config: Optional[str] = Field(
+        default=None,
+        description="高级配置 JSON 字符串，与官方 config 结构一致，会与基础配置深合并（覆盖同名字段）",
     )
 
 
@@ -123,9 +133,16 @@ class BotStatusResponse(BaseModel):
     stopped_at: Optional[str] = None
     log_file: Optional[str] = None
     error_message: Optional[str] = None
+    bot_name: Optional[str] = Field(None, description="Bot 名称（展示用）")
+    account_id: Optional[int] = Field(None, description="关联的交易账户 ID")
+    account_name: Optional[str] = Field(None, description="关联的交易账户名称")
 
     @classmethod
-    def from_process_info(cls, info: BotProcessInfo) -> "BotStatusResponse":
+    def from_process_info(
+        cls,
+        info: BotProcessInfo,
+        account_name: Optional[str] = None,
+    ) -> "BotStatusResponse":
         return cls(
             strategy_name=info.strategy_name,
             status=info.status,
@@ -136,6 +153,9 @@ class BotStatusResponse(BaseModel):
             stopped_at=info.stopped_at,
             log_file=info.log_file,
             error_message=info.error_message,
+            bot_name=getattr(info, "bot_name", None),
+            account_id=getattr(info, "account_id", None),
+            account_name=account_name,
         )
 
 
@@ -163,18 +183,88 @@ router = APIRouter(
 
 
 @router.get(
+    "/aggregate/profit",
+    summary="汇总各 Bot 盈亏",
+    description=(
+        "向所有运行中的 Bot 请求 /api/v1/profit 并合并为一份结果，"
+        "与官方 /profit 结构兼容，供前端轮询展示总盈亏。"
+    ),
+)
+def aggregate_profit() -> dict:
+    manager = get_manager()
+    return manager.aggregate_profit()
+
+
+@router.get(
+    "/health",
+    summary="健康检查",
+    description="检查 Bot Manager API 服务是否正常运行（无需认证）。",
+)
+def health_check() -> dict:
+    return {"status": "ok", "service": "bot-manager"}
+
+
+@router.get(
     "/bots",
     response_model=BotListResponse,
     summary="列出所有 Bot",
     description="返回所有已注册的 Bot 进程信息，包括运行中和已停止的历史记录。",
 )
-def list_bots() -> BotListResponse:
+def list_bots(ft_config: dict = Depends(get_config)) -> BotListResponse:
     manager = get_manager()
     all_bots = manager.list_all_bots()
-    return BotListResponse(
-        total=len(all_bots),
-        bots=[BotStatusResponse.from_process_info(bot) for bot in all_bots],
-    )
+    accounts = load_accounts(ft_config)
+    id_to_name = {a.get("id"): a.get("name") for a in accounts if a.get("id") is not None}
+    bots = [
+        BotStatusResponse.from_process_info(
+            bot,
+            account_name=id_to_name.get(getattr(bot, "account_id", None)) if getattr(bot, "account_id", None) else None,
+        )
+        for bot in all_bots
+    ]
+    return BotListResponse(total=len(bots), bots=bots)
+
+
+# 注意：带子路径的 /bots/{strategy_name}/status 与 /locks 必须放在 /bots/{strategy_name} 之前，
+# 否则 FastAPI 会把 "Bandtastic/status" 整体匹配到 strategy_name，导致子路径请求被误匹配并 404。
+@router.get(
+    "/bots/{strategy_name}/status",
+    summary="Bot 持仓状态（代理）",
+    description="请求指定 Bot 的 /api/v1/status，返回当前持仓列表。Bot 未运行时返回空列表。",
+)
+def get_bot_status_proxy(strategy_name: str):
+    """代理到 Bot 的 /api/v1/status，返回 open trades 列表。"""
+    manager = get_manager()
+    try:
+        trades = manager.get_bot_open_trades(strategy_name)
+        return trades
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+@router.get(
+    "/bots/{strategy_name}/locks",
+    summary="Bot 锁对列表（代理）",
+    description="请求指定 Bot 的 /api/v1/locks，返回当前锁对（locks）。Bot 未运行时返回空锁对。",
+)
+def get_bot_locks_proxy(strategy_name: str):
+    """代理到 Bot 的 /api/v1/locks。"""
+    manager = get_manager()
+    try:
+        locks = manager.get_bot_locks(strategy_name)
+        return locks
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
 
 
 @router.get(
@@ -185,6 +275,7 @@ def list_bots() -> BotListResponse:
 )
 def get_bot_status(
     strategy_name: str,
+    ft_config: dict = Depends(get_config),
 ) -> BotStatusResponse:
     manager = get_manager()
     info = manager.get_bot_status(strategy_name)
@@ -193,7 +284,12 @@ def get_bot_status(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"策略 [{strategy_name}] 没有注册记录",
         )
-    return BotStatusResponse.from_process_info(info)
+    account_name = None
+    if getattr(info, "account_id", None) is not None:
+        accounts = load_accounts(ft_config)
+        acc = next((a for a in accounts if a.get("id") == info.account_id), None)
+        account_name = acc.get("name") if acc else None
+    return BotStatusResponse.from_process_info(info, account_name=account_name)
 
 
 @router.post(
@@ -286,17 +382,37 @@ def start_bot_with_config(
         exchange_secret=exchange_secret,
         exchange_password=exchange_password,
     )
+    # 若有高级配置 JSON，解析后深合并到 config（用户字段覆盖基础字段）
+    if request.advanced_config and request.advanced_config.strip():
+        try:
+            extra = json.loads(request.advanced_config.strip())
+            if isinstance(extra, dict):
+                config = _deep_merge(config, extra)
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"高级配置不是合法 JSON：{e}",
+            ) from e
 
+    # Bot 子进程的 api_server 认证与 Manager 调用子进程 API 的凭据必须一致。
+    # config 里 api_server 已写死为 "pbot"/"12300"，此处传入相同凭据存入 BotProcessInfo，供后续 _call_bot_api 使用。
+    bot_api_username = (config.get("api_server") or {}).get("username", "pbot")
+    bot_api_password = (config.get("api_server") or {}).get("password", "12300")
     try:
         info = manager.start_bot_with_config(
             strategy_name=request.strategy_name,
             config=config,
             api_port=request.api_port,
+            api_username=bot_api_username,
+            api_password=bot_api_password,
+            bot_name=request.bot_name,
+            account_id=request.account_id,
         )
+        account_name = account.get("name") if account else None
         return OperationResponse(
             success=True,
             message=f"Bot [{request.strategy_name}] 启动成功（内存配置），PID={info.pid}",
-            bot=BotStatusResponse.from_process_info(info),
+            bot=BotStatusResponse.from_process_info(info, account_name=account_name),
         )
     except ValueError as error:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
@@ -304,6 +420,17 @@ def start_bot_with_config(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(error)
         ) from error
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """深合并：override 中的键覆盖 base，递归合并嵌套 dict。"""
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
 
 
 def _build_config_from_request(
@@ -321,14 +448,15 @@ def _build_config_from_request(
     dry_run = request.dry_run
 
     # 数据库文件按策略名隔离，避免多个 Bot 共用同一个 sqlite 文件
-    db_filename = f"{strategy_name}.dryrun.sqlite" if dry_run else f"{strategy_name}.sqlite"
+    # 文件名加当前时间戳，避免文件名冲突
+    db_filename = f"{strategy_name}.{time.time()}.dryrun.sqlite" if dry_run else f"{strategy_name}.{time.time()}.sqlite"
+    # db_filename = f"{strategy_name}.dryrun.sqlite" if dry_run else f"{strategy_name}.sqlite"
     db_url = f"sqlite:///user_data/tradebot/{db_filename}"
 
-    return {
+    base: dict[str, Any] = {
         # ── 基础运行配置 ──────────────────────────────────────────────
         "strategy": strategy_name,
         "dry_run": dry_run,
-        "timeframe": request.timeframe,
         "max_open_trades": request.max_open_trades,
         # ── 资金配置 ──────────────────────────────────────────────────
         "stake_currency": request.stake_currency,
@@ -344,7 +472,31 @@ def _build_config_from_request(
             "sandbox": False,
             "ccxt_config": {},
             "ccxt_async_config": {},
+            "pair_whitelist": [],
+            "pair_blacklist": []
         },
+        # ── 定价/订单流等（exchange.validate_config 必需）──────────────
+        "entry_pricing": {
+            "price_side": "same",
+            "use_order_book": True,
+            "order_book_top": 1,
+            "price_last_balance": 0.0,
+            "check_depth_of_market": {"enabled": False, "bids_to_ask_delta": 1}
+        },
+        "exit_pricing": {
+            "price_side": "same",
+            "use_order_book": True,
+            "order_book_top": 1
+        },
+        "unfilledtimeout": {
+            "entry": 10,
+            "exit": 10,
+            "exit_timeout_count": 0,
+            "unit": "minutes"
+        },
+        "cancel_open_orders_on_exit": True,
+        "trading_mode": "futures",
+        "margin_mode": "isolated",
         # ── 数据库 ────────────────────────────────────────────────────
         "db_url": db_url,
         # ── Bot 自身的 API Server 配置 ────────────────────────────────
@@ -355,10 +507,11 @@ def _build_config_from_request(
             "listen_port": request.api_port,
             "verbosity": "error",
             "enable_openapi": False,
-            "jwt_secret_key": f"pizza_bot_{strategy_name}_{request.api_port}",
-            "CORS_origins": [],
-            "username": request.api_username,
-            "password": request.api_password,
+            # RFC 7518 建议 HS256 的 key 至少 32 字节，否则会触发 InsecureKeyLengthWarning
+            "jwt_secret_key": f"pizza_bot_{strategy_name}_{request.api_port}_{secrets.token_hex(16)}",
+            "CORS_origins": ["http://localhost:{request.api_port}"],
+            "username": "pbot",
+            "password": "12300",
         },
         # ── 数据目录 ──────────────────────────────────────────────────
         "datadir": "user_data/data",
@@ -366,12 +519,17 @@ def _build_config_from_request(
         # ── 日志 ──────────────────────────────────────────────────────
         "verbosity": 0,
         # ── 其他必要默认值 ────────────────────────────────────────────
+        "bot_name": request.bot_name,
         "initial_state": "running",
         "force_entry_enable": False,
         "internals": {
             "process_throttle_secs": 5,
         },
     }
+    # 仅当请求中显式传入 timeframe 时才写入 config，否则由策略类提供（官方 StrategyResolver 行为）
+    if request.timeframe is not None:
+        base["timeframe"] = request.timeframe
+    return base
 
 
 @router.post(
@@ -495,12 +653,3 @@ def delete_bot_record(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(error),
         ) from error
-
-
-@router.get(
-    "/health",
-    summary="健康检查",
-    description="检查 Bot Manager API 服务是否正常运行（无需认证）。",
-)
-def health_check() -> dict:
-    return {"status": "ok", "service": "bot-manager"}

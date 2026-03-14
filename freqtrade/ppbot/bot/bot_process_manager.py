@@ -59,13 +59,32 @@ class BotProcessInfo:
     stopped_at: Optional[str] = None
     log_file: Optional[str] = None
     error_message: Optional[str] = None
+    # 内存配置启动时无配置文件，调用 Bot API 需用此处凭据
+    api_username: Optional[str] = None
+    api_password: Optional[str] = None
+    # 展示用：对应 config.bot_name、启动时选择的账户
+    bot_name: Optional[str] = None
+    account_id: Optional[int] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict) -> "BotProcessInfo":
-        return cls(**data)
+        # 只使用 dataclass 已有字段，兼容旧持久化文件缺少 api_username/api_password
+        from dataclasses import fields
+
+        allowed = {f.name for f in fields(cls)}
+        kwargs = {k: data.get(k) for k in allowed}
+        if "api_username" not in kwargs:
+            kwargs["api_username"] = None
+        if "api_password" not in kwargs:
+            kwargs["api_password"] = None
+        if "bot_name" not in kwargs:
+            kwargs["bot_name"] = None
+        if "account_id" not in kwargs:
+            kwargs["account_id"] = None
+        return cls(**kwargs)
 
 
 class BotProcessManager:
@@ -273,7 +292,14 @@ class BotProcessManager:
         return info
 
     def start_bot_with_config(
-        self, strategy_name: str, config: dict, api_port: int
+        self,
+        strategy_name: str,
+        config: dict,
+        api_port: int,
+        api_username: Optional[str] = None,
+        api_password: Optional[str] = None,
+        bot_name: Optional[str] = None,
+        account_id: Optional[int] = None,
     ) -> BotProcessInfo:
         """
         通过内存中的 config dict 启动 Bot 进程（方案 A：环境变量传参）。
@@ -348,6 +374,10 @@ class BotProcessManager:
             api_port=api_port,
             started_at=datetime.now().isoformat(),
             log_file=str(log_file),
+            api_username=api_username,
+            api_password=api_password,
+            bot_name=bot_name,
+            account_id=account_id,
         )
         self._processes[strategy_name] = info
         self._save_state()
@@ -534,6 +564,52 @@ class BotProcessManager:
             raise ValueError(f"策略 [{strategy_name}] 进程已意外退出")
         return info
 
+    def get_bot_open_trades(self, strategy_name: str) -> list:
+        """
+        请求指定 Bot 的 /api/v1/status，返回当前持仓（与官方 OpenTradeSchema 一致）。
+        若 Bot 未注册则抛出 ValueError；若已注册但未运行则返回空列表 []。
+        """
+        info = self._processes.get(strategy_name)
+        if not info:
+            raise ValueError(f"策略 [{strategy_name}] 没有注册记录，请先启动")
+        if info.status == BOT_STATUS_STOPPED:
+            return []
+        if info.pid and not self._is_process_alive(info.pid):
+            info.status = BOT_STATUS_STOPPED
+            info.pid = None
+            self._save_state()
+            return []
+        if not info.api_port:
+            return []
+        try:
+            data = self._call_bot_api(info, "GET", "/api/v1/status")
+            return data if isinstance(data, list) else []
+        except RuntimeError:
+            raise
+
+    def get_bot_locks(self, strategy_name: str) -> dict:
+        """
+        请求指定 Bot 的 /api/v1/locks，返回锁对列表（与官方 Locks 一致）。
+        若 Bot 未注册则抛出 ValueError；若已注册但未运行则返回空锁对。
+        """
+        info = self._processes.get(strategy_name)
+        if not info:
+            raise ValueError(f"策略 [{strategy_name}] 没有注册记录，请先启动")
+        if info.status == BOT_STATUS_STOPPED:
+            return {"lock_count": 0, "locks": []}
+        if info.pid and not self._is_process_alive(info.pid):
+            info.status = BOT_STATUS_STOPPED
+            info.pid = None
+            self._save_state()
+            return {"lock_count": 0, "locks": []}
+        if not info.api_port:
+            return {"lock_count": 0, "locks": []}
+        try:
+            data = self._call_bot_api(info, "GET", "/api/v1/locks")
+            return data if isinstance(data, dict) else {"lock_count": 0, "locks": []}
+        except RuntimeError:
+            raise
+
     def _read_api_port_from_config(self, config_path: Path) -> Optional[int]:
         """从配置文件中读取 api_server 的监听端口"""
         try:
@@ -558,6 +634,14 @@ class BotProcessManager:
         except (OSError, json.JSONDecodeError):
             return "freqtrade", ""
 
+    def _get_bot_api_credentials(self, info: BotProcessInfo) -> tuple[str, str]:
+        """获取调用该 Bot API 所需的 Basic Auth 凭据。"""
+        if info.api_username is not None and info.api_password is not None:
+            return info.api_username, info.api_password
+        if info.config_path and not info.config_path.startswith("<"):
+            return self._read_api_credentials_from_config(info.config_path)
+        return "freqtrade", ""
+
     def _call_bot_api(self, info: BotProcessInfo, method: str, endpoint: str) -> dict:
         """
         调用 Bot 自身的 REST API。
@@ -574,18 +658,15 @@ class BotProcessManager:
         import urllib.request
 
         url = f"http://127.0.0.1:{info.api_port}{endpoint}"
-        username, password = self._read_api_credentials_from_config(info.config_path)
+        username, password = self._get_bot_api_credentials(info)
         credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
 
-        request = urllib.request.Request(
-            url,
-            method=method,
-            headers={
-                "Authorization": f"Basic {credentials}",
-                "Content-Type": "application/json",
-            },
-            data=b"{}",
-        )
+        headers = {
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/json",
+        }
+        data = None if method.upper() == "GET" else b"{}"
+        request = urllib.request.Request(url, method=method, headers=headers, data=data)
 
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
@@ -596,6 +677,159 @@ class BotProcessManager:
                 f"调用 Bot API {url} 失败: {error}。"
                 f"请确认 Bot 的 api_server 已启用且端口 {info.api_port} 可访问。"
             ) from error
+
+    def aggregate_profit(self) -> dict:
+        """
+        向所有运行中的 Bot 请求 /api/v1/profit，合并为一份汇总结果（与官方 Profit 结构兼容）。
+        无运行中 Bot 时返回零值汇总。
+        """
+        running = [
+            info
+            for info in self._processes.values()
+            if info.status in (BOT_STATUS_RUNNING, BOT_STATUS_PAUSED)
+            and info.api_port
+            and (not info.pid or self._is_process_alive(info.pid))
+        ]
+        if not running:
+            return _empty_profit_response()
+
+        sum_keys = (
+            "profit_closed_coin",
+            "profit_closed_percent_sum",
+            "profit_closed_ratio_sum",
+            "profit_closed_fiat",
+            "profit_all_coin",
+            "profit_all_percent_sum",
+            "profit_all_ratio_sum",
+            "profit_all_fiat",
+            "trade_count",
+            "closed_trade_count",
+            "winning_trades",
+            "losing_trades",
+            "trading_volume",
+        )
+        first_ts_keys = ("first_trade_date", "first_trade_humanized", "first_trade_timestamp")
+        last_ts_keys = ("latest_trade_date", "latest_trade_humanized", "latest_trade_timestamp")
+
+        merged: dict = {}
+        stake_currency = "USDT"
+        first_ts = float("inf")
+        last_ts = float("-inf")
+
+        for info in running:
+            try:
+                data = self._call_bot_api(info, "GET", "/api/v1/profit")
+            except Exception as e:
+                logger.warning("聚合 [%s] profit 失败: %s", info.strategy_name, e)
+                continue
+            if not isinstance(data, dict):
+                continue
+            stake_currency = data.get("stake_currency") or stake_currency
+            for k in sum_keys:
+                if k in data and data[k] is not None:
+                    if k in ("trade_count", "closed_trade_count", "winning_trades", "losing_trades"):
+                        merged[k] = merged.get(k, 0) + int(data[k])
+                    else:
+                        merged[k] = merged.get(k, 0) + float(data[k])
+            ts = data.get("first_trade_timestamp")
+            if isinstance(ts, (int, float)) and ts and (ts < first_ts):
+                first_ts = ts
+                for k in first_ts_keys:
+                    if k in data:
+                        merged[k] = data[k]
+            ts = data.get("latest_trade_timestamp")
+            if isinstance(ts, (int, float)) and ts and (ts > last_ts):
+                last_ts = ts
+                for k in last_ts_keys:
+                    if k in data:
+                        merged[k] = data[k]
+
+        if not merged:
+            return _empty_profit_response()
+
+        merged.setdefault("stake_currency", stake_currency)
+        for k in sum_keys:
+            merged.setdefault(k, 0)
+        for k in first_ts_keys:
+            merged.setdefault(k, "" if "date" in k or "humanized" in k else 0)
+        for k in last_ts_keys:
+            merged.setdefault(k, "" if "date" in k or "humanized" in k else 0)
+        return _fill_profit_defaults(merged)
+
+
+def _empty_profit_response() -> dict:
+    return _fill_profit_defaults({
+        "profit_all_coin": 0.0,
+        "profit_all_percent": 0.0,
+        "stake_currency": "USDT",
+        "closed_trade_count": 0,
+        "trade_count": 0,
+    })
+
+
+def _fill_profit_defaults(partial: dict) -> dict:
+    """补全前端/官方 Profit 可能用到的字段，避免 KeyError。"""
+    defaults = {
+        "profit_closed_coin": 0.0,
+        "profit_closed_percent_mean": 0.0,
+        "profit_closed_ratio_mean": 0.0,
+        "profit_closed_percent_sum": 0.0,
+        "profit_closed_ratio_sum": 0.0,
+        "profit_closed_percent": 0.0,
+        "profit_closed_ratio": 0.0,
+        "profit_closed_fiat": 0.0,
+        "profit_all_coin": 0.0,
+        "profit_all_percent_mean": 0.0,
+        "profit_all_ratio_mean": 0.0,
+        "profit_all_percent_sum": 0.0,
+        "profit_all_ratio_sum": 0.0,
+        "profit_all_percent": 0.0,
+        "profit_all_ratio": 0.0,
+        "profit_all_fiat": 0.0,
+        "trade_count": 0,
+        "closed_trade_count": 0,
+        "first_trade_date": "",
+        "first_trade_humanized": "",
+        "first_trade_timestamp": 0,
+        "latest_trade_date": "",
+        "latest_trade_humanized": "",
+        "latest_trade_timestamp": 0,
+        "avg_duration": "",
+        "best_pair": "",
+        "best_rate": 0.0,
+        "best_pair_profit_ratio": 0.0,
+        "best_pair_profit_abs": 0.0,
+        "winning_trades": 0,
+        "losing_trades": 0,
+        "profit_factor": 0.0,
+        "winrate": 0.0,
+        "expectancy": 0.0,
+        "expectancy_ratio": 0.0,
+        "sharpe": 0.0,
+        "sortino": 0.0,
+        "sqn": 0.0,
+        "calmar": 0.0,
+        "cagr": 0.0,
+        "max_drawdown": 0.0,
+        "max_drawdown_abs": 0.0,
+        "max_drawdown_start": "",
+        "max_drawdown_start_timestamp": 0,
+        "max_drawdown_end": "",
+        "max_drawdown_end_timestamp": 0,
+        "current_drawdown": 0.0,
+        "current_drawdown_abs": 0.0,
+        "current_drawdown_high": 0.0,
+        "current_drawdown_start": "",
+        "current_drawdown_start_timestamp": 0,
+        "trading_volume": None,
+        "bot_start_timestamp": 0,
+        "bot_start_date": "",
+        "stake_currency": "USDT",
+    }
+    for k, v in defaults.items():
+        if k not in partial or partial[k] is None:
+            partial[k] = v
+    return partial
 
 
 # ─── 全局单例 ──────────────────────────────────────────────────────────────────
