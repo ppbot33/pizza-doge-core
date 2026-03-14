@@ -12,8 +12,9 @@ import logging
 import secrets
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from datetime import datetime
 
 from freqtrade.ppbot.bot.bot_process_manager import (
     BOT_STATUS_ERROR,
@@ -225,8 +226,8 @@ def list_bots(ft_config: dict = Depends(get_config)) -> BotListResponse:
     return BotListResponse(total=len(bots), bots=bots)
 
 
-# 注意：带子路径的 /bots/{strategy_name}/status 与 /locks 必须放在 /bots/{strategy_name} 之前，
-# 否则 FastAPI 会把 "Bandtastic/status" 整体匹配到 strategy_name，导致子路径请求被误匹配并 404。
+# 注意：所有带子路径的 /bots/{strategy_name}/xxx 必须放在 /bots/{strategy_name} 之前，
+# 否则 FastAPI 可能把 "Bandtastic/status" 等整体匹配到 strategy_name，导致 404。
 @router.get(
     "/bots/{strategy_name}/status",
     summary="Bot 持仓状态（代理）",
@@ -258,6 +259,126 @@ def get_bot_locks_proxy(strategy_name: str):
     try:
         locks = manager.get_bot_locks(strategy_name)
         return locks
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+@router.get(
+    "/bots/{strategy_name}/profit",
+    summary="Bot 盈亏（代理）",
+    description="请求指定 Bot 的 /api/v1/profit，返回盈亏汇总。Bot 未运行时返回零值。",
+)
+def get_bot_profit_proxy(strategy_name: str):
+    """代理到 Bot 的 /api/v1/profit。"""
+    manager = get_manager()
+    try:
+        return manager.get_bot_profit(strategy_name)
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+class PairCandlesRequestBody(BaseModel):
+    """与官方 POST /api/v1/pair_candles 请求体一致，columns 为字符串数组"""
+
+    pair: str
+    timeframe: str
+    limit: Optional[int] = None
+    columns: Optional[list[str]] = None
+
+
+@router.post(
+    "/bots/{strategy_name}/pair_candles",
+    summary="Bot K 线（POST，支持 columns 字符串数组）",
+    description="与官方一致：POST 请求体含 pair、timeframe、limit、columns（字符串数组），返回含 Entry/Exit 标记列。仅 Bot 运行中时可调用。",
+)
+def post_bot_pair_candles_proxy(strategy_name: str, body: PairCandlesRequestBody):
+    """代理到 Bot 的 POST /api/v1/pair_candles，请求体原样转发。"""
+    manager = get_manager()
+    try:
+        return manager.get_bot_pair_candles(
+            strategy_name,
+            pair=body.pair,
+            timeframe=body.timeframe,
+            limit=body.limit,
+            columns=body.columns,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+@router.get(
+    "/bots/{strategy_name}/pair_candles",
+    summary="Bot K 线（GET，无 columns）",
+    description="请求指定 Bot 的 GET /api/v1/pair_candles，返回基础 K 线。需 Entry/Exit 标记时请用 POST 并传 columns。仅 Bot 运行中时可调用。",
+)
+def get_bot_pair_candles_proxy(
+    strategy_name: str,
+    pair: str = Query(..., description="交易对，如 BTC/USDT"),
+    timeframe: str = Query(..., description="时间周期，如 5m、1h"),
+    limit: Optional[int] = Query(None, description="K 线数量"),
+):
+    """代理到 Bot 的 GET /api/v1/pair_candles（不传 columns）。"""
+    manager = get_manager()
+    try:
+        return manager.get_bot_pair_candles(
+            strategy_name, pair=pair, timeframe=timeframe, limit=limit, columns=None
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+@router.get(
+    "/bots/{strategy_name}/whitelist",
+    summary="Bot 交易对白名单（代理）",
+    description="请求指定 Bot 的 /api/v1/whitelist，返回当前交易对列表。Bot 未运行时返回空列表。",
+)
+def get_bot_whitelist_proxy(strategy_name: str):
+    """代理到 Bot 的 /api/v1/whitelist。"""
+    manager = get_manager()
+    try:
+        return manager.get_bot_whitelist(strategy_name)
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot API 请求失败: {error}",
+        ) from error
+
+
+@router.get(
+    "/bots/{strategy_name}/logs",
+    summary="Bot 日志（代理）",
+    description="请求指定 Bot 的 /api/v1/logs，返回最近日志。Bot 未运行时返回空列表。",
+)
+def get_bot_logs_proxy(
+    strategy_name: str,
+    limit: Optional[int] = Query(None, description="返回条数限制"),
+):
+    """代理到 Bot 的 /api/v1/logs。"""
+    manager = get_manager()
+    try:
+        return manager.get_bot_logs(strategy_name, limit=limit)
     except ValueError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
     except RuntimeError as error:
@@ -449,7 +570,7 @@ def _build_config_from_request(
 
     # 数据库文件按策略名隔离，避免多个 Bot 共用同一个 sqlite 文件
     # 文件名加当前时间戳，避免文件名冲突
-    db_filename = f"{strategy_name}.{time.time()}.dryrun.sqlite" if dry_run else f"{strategy_name}.{time.time()}.sqlite"
+    db_filename = f"{strategy_name}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.dryrun.sqlite" if dry_run else f"{strategy_name}.{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite"
     # db_filename = f"{strategy_name}.dryrun.sqlite" if dry_run else f"{strategy_name}.sqlite"
     db_url = f"sqlite:///user_data/tradebot/{db_filename}"
 

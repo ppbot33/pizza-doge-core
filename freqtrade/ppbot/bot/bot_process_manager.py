@@ -610,6 +610,103 @@ class BotProcessManager:
         except RuntimeError:
             raise
 
+    def get_bot_profit(self, strategy_name: str) -> dict:
+        """
+        请求指定 Bot 的 /api/v1/profit，返回盈亏汇总（与官方 Profit 一致）。
+        若 Bot 未注册则抛出 ValueError；若已注册但未运行则返回空结构（零值）。
+        """
+        info = self._processes.get(strategy_name)
+        if not info:
+            raise ValueError(f"策略 [{strategy_name}] 没有注册记录，请先启动")
+        if info.status == BOT_STATUS_STOPPED or not info.api_port:
+            return _empty_profit_response()
+        if info.pid and not self._is_process_alive(info.pid):
+            info.status = BOT_STATUS_STOPPED
+            info.pid = None
+            self._save_state()
+            return _empty_profit_response()
+        try:
+            data = self._call_bot_api(info, "GET", "/api/v1/profit")
+            return data if isinstance(data, dict) else _empty_profit_response()
+        except RuntimeError:
+            raise
+
+    def get_bot_pair_candles(
+        self,
+        strategy_name: str,
+        pair: str,
+        timeframe: str,
+        limit: Optional[int] = None,
+        columns: Optional[list[str]] = None,
+    ) -> dict:
+        """
+        请求指定 Bot 的 /api/v1/pair_candles，返回 K 线数据（与官方 PairHistory 一致）。
+        若传入 columns（如 ["enter_tag", "exit_tag"]），则使用 POST 请求以返回对应列及 Entry/Exit 标记。
+        Bot 未注册或未运行则抛出 ValueError。
+        """
+        from urllib.parse import urlencode
+
+        info = self._get_running_bot(strategy_name)
+        if not info.api_port:
+            raise ValueError(f"策略 [{strategy_name}] 未配置 API 端口")
+        if columns:
+            payload = {"pair": pair, "timeframe": timeframe, "limit": limit, "columns": columns}
+            return self._call_bot_api(info, "POST", "/api/v1/pair_candles", body=payload)
+        params = {"pair": pair, "timeframe": timeframe}
+        if limit is not None:
+            params["limit"] = str(limit)
+        endpoint = "/api/v1/pair_candles?" + urlencode(params)
+        return self._call_bot_api(info, "GET", endpoint)
+
+    def get_bot_whitelist(self, strategy_name: str) -> dict:
+        """
+        请求指定 Bot 的 /api/v1/whitelist，返回交易对白名单。
+        若 Bot 未注册或未运行则返回空白名单 { "whitelist": [], "length": 0 }。
+        """
+        info = self._processes.get(strategy_name)
+        if not info:
+            raise ValueError(f"策略 [{strategy_name}] 没有注册记录，请先启动")
+        if info.status == BOT_STATUS_STOPPED or not info.api_port:
+            return {"whitelist": [], "length": 0, "method": []}
+        if info.pid and not self._is_process_alive(info.pid):
+            info.status = BOT_STATUS_STOPPED
+            info.pid = None
+            self._save_state()
+            return {"whitelist": [], "length": 0, "method": []}
+        try:
+            data = self._call_bot_api(info, "GET", "/api/v1/whitelist")
+            if isinstance(data, dict) and "whitelist" in data:
+                return data
+            return {"whitelist": [], "length": 0, "method": []}
+        except RuntimeError:
+            raise
+
+    def get_bot_logs(self, strategy_name: str, limit: Optional[int] = None) -> dict:
+        """
+        请求指定 Bot 的 /api/v1/logs，返回最近日志。
+        若 Bot 未注册或未运行则返回空列表 { "log_count": 0, "logs": [] }。
+        """
+        info = self._processes.get(strategy_name)
+        if not info:
+            raise ValueError(f"策略 [{strategy_name}] 没有注册记录，请先启动")
+        if info.status == BOT_STATUS_STOPPED or not info.api_port:
+            return {"log_count": 0, "logs": []}
+        if info.pid and not self._is_process_alive(info.pid):
+            info.status = BOT_STATUS_STOPPED
+            info.pid = None
+            self._save_state()
+            return {"log_count": 0, "logs": []}
+        try:
+            path = "/api/v1/logs"
+            if limit is not None:
+                path = f"{path}?limit={int(limit)}"
+            data = self._call_bot_api(info, "GET", path)
+            if isinstance(data, dict) and "logs" in data:
+                return data
+            return {"log_count": 0, "logs": []}
+        except RuntimeError:
+            raise
+
     def _read_api_port_from_config(self, config_path: Path) -> Optional[int]:
         """从配置文件中读取 api_server 的监听端口"""
         try:
@@ -642,7 +739,9 @@ class BotProcessManager:
             return self._read_api_credentials_from_config(info.config_path)
         return "freqtrade", ""
 
-    def _call_bot_api(self, info: BotProcessInfo, method: str, endpoint: str) -> dict:
+    def _call_bot_api(
+        self, info: BotProcessInfo, method: str, endpoint: str, body: Optional[dict] = None
+    ) -> dict:
         """
         调用 Bot 自身的 REST API。
         使用 HTTP Basic Auth 认证。
@@ -650,6 +749,7 @@ class BotProcessManager:
         :param info: BotProcessInfo
         :param method: HTTP 方法（GET/POST）
         :param endpoint: API 路径，如 "/api/v1/start"
+        :param body: POST 时可选请求体（dict），将序列化为 JSON
         :return: 响应 JSON
         :raises RuntimeError: 请求失败时
         """
@@ -665,7 +765,11 @@ class BotProcessManager:
             "Authorization": f"Basic {credentials}",
             "Content-Type": "application/json",
         }
-        data = None if method.upper() == "GET" else b"{}"
+        if method.upper() == "GET":
+            data = None
+        else:
+            payload = body if body is not None else {}
+            data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(url, method=method, headers=headers, data=data)
 
         try:
